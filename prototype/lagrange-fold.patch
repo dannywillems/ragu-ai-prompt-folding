@@ -1,0 +1,507 @@
+diff --git a/crates/ragu_pcd/src/internal/fold_revdot.rs b/crates/ragu_pcd/src/internal/fold_revdot.rs
+index 9f529999..6f0d9e99 100644
+--- a/crates/ragu_pcd/src/internal/fold_revdot.rs
++++ b/crates/ragu_pcd/src/internal/fold_revdot.rs
+@@ -327,6 +327,502 @@ pub fn fold_two_layer<'dr, D: Driver<'dr>, P: Parameters>(
+     Element::fold(dr, results.iter(), layer2_scale)
+ }
+ 
++/// Prototype: single-layer Lagrange folding of revdot claims.
++///
++/// This is an alternative to the two-layer monomial reduction above
++/// ([`ClaimFolder`], [`fold_inner`], [`fold_outer`]). It is **not wired into
++/// the fuse or compress pipelines**; it exists to measure cost and check
++/// correctness.
++///
++/// # Construction
++///
++/// Fix the domain $\{0, 1, \ldots, k-1\}$ with Lagrange basis $L_i$ and
++/// vanishing polynomial $Z(X) = \prod_i (X - i)$. For claims
++/// $\mathrm{revdot}(a_i, b_i) = c_i$ put $a(X) = \sum_i L_i(X) a_i$,
++/// $b(X) = \sum_i L_i(X) b_i$ and $G(X) = \mathrm{revdot}(a(X), b(X))$, a
++/// polynomial of degree at most $2(k-1)$ with $G(i) = c_i$ when every claim
++/// holds. Let $I(X)$ interpolate the $c_i$. The prover sends the $k-1$
++/// coefficients of $K = (G - I) / Z$, and after the challenge $\gamma$ the
++/// folded claim is
++///
++/// $$
++/// \Big(\sum_i L_i(\gamma) a_i,\ \sum_i L_i(\gamma) b_i,\
++///   I(\gamma) + Z(\gamma) K(\gamma)\Big).
++/// $$
++///
++/// This is the ProtoGalaxy fold (Eagen and Gabizon, ePrint 2023/1106)
++/// specialised to the bilinear revdot relation.
++///
++/// # Soundness
++///
++/// If some $\mathrm{revdot}(a_l, b_l) \neq c_l$ then $G - I - ZK$ is a
++/// nonzero polynomial of degree at most $2(k-1)$ fixed before $\gamma$, so a
++/// false claim survives with probability at most $2(k-1)/|\mathcal{C}|$ over
++/// the challenge set $\mathcal{C}$. The fold is $(2k-1)$-special sound: from
++/// $2k-1$ accepting transcripts sharing $K$, the inputs are recovered by
++/// inverting the matrix $(L_i(\gamma_t))$. A $\gamma$ in the domain makes
++/// $\gamma - i$ non-invertible, so the in-circuit inversion rejects it.
++///
++/// # Cost
++///
++/// $k - 1$ error terms instead of $k(k-1)$, and $5k - 2$ multiplication gates
++/// in [`lagrange::fold_claims`], in one layer.
++#[cfg_attr(not(test), allow(dead_code))]
++pub mod lagrange {
++    use alloc::vec::Vec;
++    use core::borrow::Borrow;
++
++    use ragu_circuits::{
++        horner::Horner,
++        polynomials::{Rank, sparse},
++    };
++    use ragu_core::{
++        Result,
++        drivers::{Coeff, Driver},
++    };
++    use ragu_primitives::{Element, io::Buffer};
++    use udon::field::Field;
++
++    use super::Foldable;
++
++    fn point<F: Field>(i: usize) -> F {
++        F::from(i as u64)
++    }
++
++    /// Barycentric weights $w_i = \prod_{j \neq i} (i - j)^{-1}$ of the domain
++    /// $\{0, \ldots, k-1\}$, so that $L_i(x) = Z(x)\, w_i / (x - i)$.
++    pub fn barycentric_weights<F: Field>(k: usize) -> Vec<F> {
++        (0..k)
++            .map(|i| {
++                (0..k)
++                    .filter(|&j| j != i)
++                    .map(|j| point::<F>(i) - point::<F>(j))
++                    .product::<F>()
++                    .invert()
++                    .expect("domain points are distinct")
++            })
++            .collect()
++    }
++
++    /// The Lagrange weights $L_i(x)$ for $i < k$, or `None` if $x$ is a domain
++    /// point.
++    pub fn weights<F: Field>(k: usize, x: F) -> Option<Vec<F>> {
++        let diffs: Vec<F> = (0..k).map(|i| x - point::<F>(i)).collect();
++        let z: F = diffs.iter().product();
++        let w = barycentric_weights::<F>(k);
++        diffs
++            .iter()
++            .zip(&w)
++            .map(|(d, wi)| d.invert().map(|inv| z * wi * inv))
++            .collect()
++    }
++
++    /// $Z(x) = \prod_{i<k} (x - i)$.
++    fn vanishing<F: Field>(k: usize, x: F) -> F {
++        (0..k).map(|i| x - point::<F>(i)).product()
++    }
++
++    /// Weighted sum $\sum_i w_i \cdot \mathrm{item}_i$ of [`Foldable`] values
++    /// (polynomials, or polynomials tracked with their commitments).
++    pub fn fold_weighted<T: Foldable<F>, F: Field>(items: &[impl Borrow<T>], weights: &[F]) -> T {
++        assert_eq!(items.len(), weights.len(), "one weight per item");
++        items
++            .iter()
++            .zip(weights)
++            .fold(T::default(), |mut acc, (item, w)| {
++                let mut term = item.borrow().clone();
++                term.fold_scale(*w);
++                acc.fold_add_assign(&term);
++                acc
++            })
++    }
++
++    /// Monomial coefficients (ascending) of the polynomial of degree
++    /// `< xs.len()` through `(xs[t], ys[t])`, via Newton divided differences.
++    fn interpolate<F: Field>(xs: &[F], ys: &[F]) -> Vec<F> {
++        let n = xs.len();
++        let mut dd = ys.to_vec();
++        for level in 1..n {
++            for t in (level..n).rev() {
++                let den = (xs[t] - xs[t - level])
++                    .invert()
++                    .expect("interpolation points are distinct");
++                dd[t] = (dd[t] - dd[t - 1]) * den;
++            }
++        }
++        // Expand the Newton form from the innermost term outwards.
++        let mut coeffs = alloc::vec![F::ZERO; n];
++        for t in (0..n).rev() {
++            // coeffs <- coeffs * (X - xs[t]) + dd[t]
++            let mut next = alloc::vec![F::ZERO; n];
++            for (deg, c) in coeffs.iter().enumerate() {
++                if deg + 1 < n {
++                    next[deg + 1] += *c;
++                }
++                next[deg] -= *c * xs[t];
++            }
++            next[0] += dd[t];
++            coeffs = next;
++        }
++        coeffs
++    }
++
++    /// Prover side: the $k-1$ coefficients (ascending) of
++    /// $K = (G - I) / Z$, where `ky` are the claimed targets $c_i$.
++    ///
++    /// $K$ is evaluated at the $k-1$ points $k, \ldots, 2k-2$ outside the
++    /// domain, as $(G(t) - I(t)) / Z(t)$, and interpolated. This uses $k-1$
++    /// weighted sums of the $a_i$ and $b_i$ and $k-1$ revdot products; an LDE
++    /// over a two-adic domain would bring the polynomial work to
++    /// $O(k \log k)$ per coefficient.
++    ///
++    /// If every claim holds, the result satisfies $G = I + ZK$. If not, it
++    /// is still a polynomial of degree at most $k-2$, and the identity fails
++    /// at the domain point of the false claim.
++    pub fn error_terms_with_backend<B: ragu_backend::Backend, F: Field, R: Rank>(
++        a: &[impl Borrow<sparse::Polynomial<F, R>>],
++        b: &[impl Borrow<sparse::Polynomial<F, R>>],
++        ky: &[F],
++    ) -> Vec<F> {
++        let k = ky.len();
++        assert!(k >= 1, "at least one claim");
++        assert_eq!(a.len(), k, "one a polynomial per claim");
++        assert_eq!(b.len(), k, "one b polynomial per claim");
++        let xs: Vec<F> = (k..2 * k - 1).map(point::<F>).collect();
++        let ys: Vec<F> = xs
++            .iter()
++            .map(|&x| {
++                let w = weights::<F>(k, x).expect("x is outside the domain");
++                let ax: sparse::Polynomial<F, R> = fold_weighted(a, &w);
++                let bx: sparse::Polynomial<F, R> = fold_weighted(b, &w);
++                let g = B::sparse_revdot(&ax, &bx);
++                let i: F = w.iter().zip(ky).map(|(l, c)| *l * c).sum();
++                (g - i)
++                    * vanishing::<F>(k, x)
++                        .invert()
++                        .expect("x is outside the domain")
++            })
++            .collect();
++        interpolate(&xs, &ys)
++    }
++
++    /// [`error_terms_with_backend`] with the reference backend.
++    #[cfg(test)]
++    pub fn error_terms<F: Field, R: Rank>(
++        a: &[impl Borrow<sparse::Polynomial<F, R>>],
++        b: &[impl Borrow<sparse::Polynomial<F, R>>],
++        ky: &[F],
++    ) -> Vec<F> {
++        error_terms_with_backend::<ragu_backend::ReferenceBackend, F, R>(a, b, ky)
++    }
++
++    /// Verifier side (in circuit): the folded target $c^\ast$ and the weights
++    /// $L_i(\gamma)$, which the caller needs to fold the $a_i, b_i$ (or to
++    /// spot-check their commitments).
++    ///
++    /// Gates: $k-1$ for $Z(\gamma)$, $k$ inversions, $k$ for the $L_i$, $k$ for
++    /// $I(\gamma)$, $k-2$ for Horner on $K$, and $1$ for $Z(\gamma) K(\gamma)$:
++    /// $5k - 2$ in total.
++    ///
++    /// # Errors
++    ///
++    /// Witness generation fails if $\gamma$ is a domain point, since
++    /// $\gamma - i$ then has no inverse.
++    ///
++    /// # Panics
++    ///
++    /// Panics if `ky_values` is empty or `error_coeffs.len() != k - 1`.
++    pub fn fold_claims<'dr, D: Driver<'dr>>(
++        dr: &mut D,
++        gamma: &Element<'dr, D>,
++        error_coeffs: &[Element<'dr, D>],
++        ky_values: &[Element<'dr, D>],
++    ) -> Result<(Element<'dr, D>, Vec<Element<'dr, D>>)> {
++        let k = ky_values.len();
++        assert!(k >= 1, "at least one claim");
++        assert_eq!(error_coeffs.len(), k - 1, "K has k - 1 coefficients");
++
++        let diffs: Vec<Element<'dr, D>> = (0..k)
++            .map(|i| {
++                let c = Element::constant(dr, point::<D::F>(i));
++                gamma.sub(dr, &c)
++            })
++            .collect();
++
++        let mut z = diffs[0].clone();
++        for d in &diffs[1..] {
++            z = z.mul(dr, d)?;
++        }
++
++        let w = barycentric_weights::<D::F>(k);
++        let mut lagrange = Vec::with_capacity(k);
++        for (d, wi) in diffs.iter().zip(w) {
++            let inv = d.invert(dr)?;
++            lagrange.push(z.mul(dr, &inv)?.scale(dr, Coeff::Arbitrary(wi)));
++        }
++
++        let mut i_gamma = Element::zero(dr);
++        for (l, c) in lagrange.iter().zip(ky_values) {
++            let term = l.mul(dr, c)?;
++            i_gamma = i_gamma.add(dr, &term);
++        }
++
++        let mut horner = Horner::new(gamma);
++        for coeff in error_coeffs.iter().rev() {
++            horner.write(dr, coeff)?;
++        }
++        let k_gamma = horner.finish(dr);
++        let zk = z.mul(dr, &k_gamma)?;
++
++        Ok((i_gamma.add(dr, &zk), lagrange))
++    }
++
++    #[cfg(test)]
++    mod tests {
++        use alloc::vec::Vec;
++
++        use ragu_circuits::polynomials::{TestRank, sparse};
++        use ragu_core::{drivers::emulator::Emulator, maybe::Maybe, pasta::Fp};
++        use ragu_primitives::{Element, Simulator};
++        use rand::{Rng, SeedableRng, rngs::StdRng};
++        use udon::field::Field;
++
++        use super::*;
++
++        type Poly = sparse::Polynomial<Fp, TestRank>;
++
++        fn rand_fp(rng: &mut StdRng) -> Fp {
++            Fp::random(|bytes| rng.fill_bytes(bytes))
++        }
++
++        fn claims(rng: &mut StdRng, k: usize) -> (Vec<Poly>, Vec<Poly>, Vec<Fp>) {
++            let a: Vec<Poly> = (0..k).map(|_| Poly::random(rng)).collect();
++            let b: Vec<Poly> = (0..k).map(|_| Poly::random(rng)).collect();
++            let c = a.iter().zip(&b).map(|(x, y)| x.revdot(y)).collect();
++            (a, b, c)
++        }
++
++        /// Runs the verifier in the emulator; returns (c*, weights).
++        fn verify(gamma: Fp, coeffs: &[Fp], ky: &[Fp]) -> Result<(Fp, Vec<Fp>)> {
++            let dr = &mut Emulator::execute();
++            let g = Element::constant(dr, gamma);
++            let e: Vec<_> = coeffs.iter().map(|&v| Element::constant(dr, v)).collect();
++            let c: Vec<_> = ky.iter().map(|&v| Element::constant(dr, v)).collect();
++            let (cstar, w) = fold_claims(dr, &g, &e, &c)?;
++            Ok((
++                *cstar.value().take(),
++                w.iter().map(|x| *x.value().take()).collect(),
++            ))
++        }
++
++        #[test]
++        fn honest_fold_is_accepted() -> Result<()> {
++            let mut rng = StdRng::seed_from_u64(1);
++            for k in [1, 2, 3, 7, 19] {
++                let (a, b, c) = claims(&mut rng, k);
++                let coeffs = error_terms(&a, &b, &c);
++                assert_eq!(coeffs.len(), k - 1);
++
++                let gamma = rand_fp(&mut rng);
++                let (cstar, w) = verify(gamma, &coeffs, &c)?;
++                assert_eq!(Some(w.clone()), weights::<Fp>(k, gamma));
++
++                let astar: Poly = fold_weighted(&a, &w);
++                let bstar: Poly = fold_weighted(&b, &w);
++                assert_eq!(astar.revdot(&bstar), cstar, "k = {k}");
++            }
++            Ok(())
++        }
++
++        #[test]
++        fn false_claim_is_rejected() -> Result<()> {
++            let mut rng = StdRng::seed_from_u64(2);
++            for k in [2, 3, 7, 19] {
++                let (a, b, mut c) = claims(&mut rng, k);
++                c[k / 2] += Fp::ONE;
++                // The prover's best message: the quotient for the false
++                // targets, which no longer makes G - I divisible by Z.
++                let coeffs = error_terms(&a, &b, &c);
++                let gamma = rand_fp(&mut rng);
++                let (cstar, w) = verify(gamma, &coeffs, &c)?;
++                let astar: Poly = fold_weighted(&a, &w);
++                let bstar: Poly = fold_weighted(&b, &w);
++                assert_ne!(astar.revdot(&bstar), cstar, "k = {k}");
++            }
++            Ok(())
++        }
++
++        #[test]
++        fn shifting_a_claim_into_k_is_rejected() -> Result<()> {
++            // The monomial-weight forgery (shift a diagonal target into a
++            // colliding cross term) has no analogue here: perturbing c_l by
++            // delta and K by any fixed polynomial changes c* by a nonzero
++            // polynomial in gamma unless both perturbations vanish.
++            let mut rng = StdRng::seed_from_u64(3);
++            let k = 7;
++            let (a, b, c) = claims(&mut rng, k);
++            let honest = error_terms(&a, &b, &c);
++            for l in 0..k {
++                let mut cf = c.clone();
++                cf[l] += Fp::ONE;
++                for t in 0..k - 1 {
++                    let mut kf = honest.clone();
++                    kf[t] -= Fp::ONE;
++                    let gamma = rand_fp(&mut rng);
++                    let (cstar, w) = verify(gamma, &kf, &cf)?;
++                    let astar: Poly = fold_weighted(&a, &w);
++                    let bstar: Poly = fold_weighted(&b, &w);
++                    assert_ne!(astar.revdot(&bstar), cstar);
++                }
++            }
++            Ok(())
++        }
++
++        #[test]
++        fn gamma_in_domain_fails_witness_generation() {
++            let mut rng = StdRng::seed_from_u64(4);
++            let k = 5;
++            let (a, b, c) = claims(&mut rng, k);
++            let coeffs = error_terms(&a, &b, &c);
++            assert!(verify(Fp::from(3), &coeffs, &c).is_err());
++            assert!(weights::<Fp>(k, Fp::from(3)).is_none());
++        }
++
++        #[test]
++        fn extractor_recovers_claims() {
++            // Proposition 5.5 of the accompanying note: 2k-1 transcripts
++            // sharing K determine every (a_i, b_i), and the claims hold.
++            let mut rng = StdRng::seed_from_u64(5);
++            let k = 4;
++            let (a, b, c) = claims(&mut rng, k);
++            let coeffs = error_terms(&a, &b, &c);
++            let gammas: Vec<Fp> = (0..2 * k - 1).map(|_| rand_fp(&mut rng)).collect();
++            let transcripts: Vec<(Vec<Fp>, Poly, Poly)> = gammas
++                .iter()
++                .map(|&g| {
++                    let w = weights::<Fp>(k, g).unwrap();
++                    let astar: Poly = fold_weighted(&a, &w);
++                    let bstar: Poly = fold_weighted(&b, &w);
++                    let cstar: Fp = w.iter().zip(&c).map(|(l, ci)| *l * ci).sum::<Fp>()
++                        + vanishing::<Fp>(k, g)
++                            * coeffs.iter().rev().fold(Fp::ZERO, |acc, x| acc * g + x);
++                    assert_eq!(astar.revdot(&bstar), cstar);
++                    (w, astar, bstar)
++                })
++                .collect();
++
++            // Invert V = (L_i(gamma_t)) for t < k by Gauss-Jordan.
++            let mut m: Vec<Vec<Fp>> = transcripts[..k]
++                .iter()
++                .enumerate()
++                .map(|(t, (w, _, _))| {
++                    let mut row = w.clone();
++                    row.extend((0..k).map(|j| if j == t { Fp::ONE } else { Fp::ZERO }));
++                    row
++                })
++                .collect();
++            for col in 0..k {
++                let piv = (col..k).find(|&r| !m[r][col].is_zero()).unwrap();
++                m.swap(col, piv);
++                let s = m[col][col].invert().unwrap();
++                m[col].iter_mut().for_each(|x| *x *= s);
++                for r in 0..k {
++                    if r != col && !m[r][col].is_zero() {
++                        let f = m[r][col];
++                        let pivot_row = m[col].clone();
++                        m[r].iter_mut()
++                            .zip(&pivot_row)
++                            .for_each(|(x, y)| *x -= f * y);
++                    }
++                }
++            }
++            let vinv: Vec<Vec<Fp>> = m.into_iter().map(|row| row[k..].to_vec()).collect();
++            let heads_a: Vec<&Poly> = transcripts[..k].iter().map(|t| &t.1).collect();
++            let heads_b: Vec<&Poly> = transcripts[..k].iter().map(|t| &t.2).collect();
++            let ea: Vec<Poly> = vinv
++                .iter()
++                .map(|row| fold_weighted(&heads_a, row))
++                .collect();
++            let eb: Vec<Poly> = vinv
++                .iter()
++                .map(|row| fold_weighted(&heads_b, row))
++                .collect();
++            // Consistency: the extracted inputs reproduce every remaining
++            // transcript (a mismatch would be a binding break).
++            let coeffs_of = |p: &Poly| p.iter_coeffs().collect::<Vec<Fp>>();
++            for (w, astar, bstar) in &transcripts[k..] {
++                let fa: Poly = fold_weighted(&ea, w);
++                let fb: Poly = fold_weighted(&eb, w);
++                assert_eq!(coeffs_of(&fa), coeffs_of(astar));
++                assert_eq!(coeffs_of(&fb), coeffs_of(bstar));
++            }
++            for i in 0..k {
++                assert_eq!(ea[i].revdot(&eb[i]), c[i]);
++            }
++        }
++
++        /// Gates of the deployed two-layer fold at full capacity (one
++        /// `ClaimFolder` per layer, every group folded).
++        fn two_layer_gates<P: super::super::Parameters>() -> Result<usize> {
++            use ragu_primitives::vec::{FixedVec, Len};
++
++            use super::super::ClaimFolder;
++            let sim = Simulator::simulate((), |dr, _| {
++                let mut rng = StdRng::seed_from_u64(9);
++                let mut el = |dr: &mut Simulator<Fp>| Element::constant(dr, rand_fp(&mut rng));
++                let (mu, nu, mu2, nu2) = (el(dr), el(dr), el(dr), el(dr));
++                let inner = ClaimFolder::new(dr, &mu, &nu)?;
++                let mut groups = Vec::new();
++                for _ in 0..P::NumGroups::len() {
++                    let e = FixedVec::from_fn(|_| el(dr));
++                    let ky = FixedVec::from_fn(|_| el(dr));
++                    groups.push(inner.fold_inner::<P>(dr, &e, &ky)?);
++                }
++                let outer = ClaimFolder::new(dr, &mu2, &nu2)?;
++                let e = FixedVec::from_fn(|_| el(dr));
++                let ky = FixedVec::from_fn(|t| groups[t].clone());
++                outer.fold_outer::<P>(dr, &e, &ky)?;
++                Ok(())
++            })?;
++            Ok(sim.num_gates())
++        }
++
++        #[test]
++        fn cheaper_than_deployed_two_layer_fold() -> Result<()> {
++            use crate::internal::native::RevdotParameters;
++            let two_layer = two_layer_gates::<RevdotParameters>()?;
++            // The book's accounting: N M^2 + N^2 - N + 3 for (M, N) = (7, 19).
++            assert_eq!(two_layer, 1276);
++            // Lagrange at the same capacity (133) and at the 93 claims a fuse
++            // step actually produces.
++            assert_eq!(5 * 133 - 2, 663);
++            assert_eq!(5 * 93 - 2, 463);
++            assert!(5 * 133 - 2 < two_layer);
++            Ok(())
++        }
++
++        #[test]
++        fn gate_count_is_5k_minus_2() -> Result<()> {
++            for k in [2usize, 7, 19, 93, 133] {
++                let sim = Simulator::simulate((), |dr, _| {
++                    let mut rng = StdRng::seed_from_u64(k as u64);
++                    let g = Element::constant(dr, rand_fp(&mut rng));
++                    let e: Vec<_> = (0..k - 1)
++                        .map(|_| Element::constant(dr, rand_fp(&mut rng)))
++                        .collect();
++                    let c: Vec<_> = (0..k)
++                        .map(|_| Element::constant(dr, rand_fp(&mut rng)))
++                        .collect();
++                    fold_claims(dr, &g, &e, &c)?;
++                    Ok(())
++                })?;
++                assert_eq!(sim.num_gates(), 5 * k - 2, "k = {k}");
++            }
++            Ok(())
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use alloc::{vec, vec::Vec};

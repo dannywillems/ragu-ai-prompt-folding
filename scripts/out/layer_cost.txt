@@ -1,0 +1,28 @@
+n = 93 claims
+  ragu   (7,19) as deployed       :  1036 constraints,   930 cross terms
+  ragu   best 1-layer (93,)       :  8650 constraints,  8556 cross terms
+  ragu   best 2-layer (6, 16)     :   819 constraints,   720 cross terms
+  ragu   best 3-layer (3, 4, 8)   :   437 constraints,   338 cross terms
+  convex best 1-layer (93,)       :  4466 constraints,  4278 cross terms
+  convex best 2-layer (6, 16)     :   588 constraints,   360 cross terms
+  convex best 3-layer (3, 4, 8)   :   441 constraints,   169 cross terms
+  ap3    best 2-layer (4, 24)     :   362 constraints,   253 cross terms
+  ap3    best 3-layer (2, 4, 12)  :   254 constraints,   152 cross terms
+  lagrange best 1-layer (93,)       :   465 constraints,    92 cross terms
+  lagrange best 2-layer (93, 2)     :   475 constraints,    93 cross terms
+  lagrange best 3-layer (19, 5, 2)  :   502 constraints,    95 cross terms
+
+n = 133 claims
+  ragu   (7,19) as deployed       :  1276 constraints,  1140 cross terms
+  ragu   best 1-layer (133,)      : 17690 constraints, 17556 cross terms
+  ragu   best 2-layer (7, 19)     :  1276 constraints,  1140 cross terms
+  ragu   best 3-layer (3, 5, 9)   :   662 constraints,   522 cross terms
+  convex best 1-layer (133,)      :  9046 constraints,  8778 cross terms
+  convex best 2-layer (7, 19)     :   878 constraints,   570 cross terms
+  convex best 3-layer (3, 5, 9)   :   645 constraints,   261 cross terms
+  ap3    best 2-layer (8, 17)     :   546 constraints,   399 cross terms
+  ap3    best 3-layer (2, 4, 17)  :   376 constraints,   228 cross terms
+  lagrange best 1-layer (133,)      :   665 constraints,   132 cross terms
+  lagrange best 2-layer (133, 2)    :   675 constraints,   133 cross terms
+  lagrange best 3-layer (19, 7, 2)  :   698 constraints,   133 cross terms
+

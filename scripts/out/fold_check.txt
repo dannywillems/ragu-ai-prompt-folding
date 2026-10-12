@@ -1,0 +1,7 @@
+scheme   n  cross_terms_sent  clashes  honest  attack_accepted
+ragu      7                42        0  True    False
+convex    7                21        0  True    False
+ap3free   7                16        0  True    False
+ragu      3                 6        0  True    False
+ap3free   3                 3        0  True    False
+ap3bad    3                 3        1  True    True

@@ -1,0 +1,11 @@
+k  cross_terms(lagrange)  cross_terms(ragu)  honest  remainder_if_false  false_accepted
+ 2                      1                  2  True    True                False
+ 3                      2                  6  True    True                False
+ 7                      6                 42  True    True                False
+19                     18                342  True    True                False
+
+k  extractor: 2k-1 transcripts -> all claims recovered and valid
+ 2  True
+ 3  True
+ 7  True
+19  True
